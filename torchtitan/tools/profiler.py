@@ -328,16 +328,20 @@ class Profiler(Configurable):
         elif torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
 
+        profiler_schedule = torch.profiler.schedule(
+            wait=wait, warmup=warmup, active=active, **additional_params
+        )
         torch_profiler = torch.profiler.profile(
             activities=activities,
-            schedule=torch.profiler.schedule(
-                wait=wait, warmup=warmup, active=active, **additional_params
-            ),
+            schedule=profiler_schedule,
             on_trace_ready=trace_handler,
             record_shapes=True,
         )
-        torch_profiler.__enter__()
         torch_profiler.step_num = global_step
+        torch_profiler.current_action = profiler_schedule(global_step)
+        if hasattr(torch_profiler, "_prev_schedule_action"):
+            torch_profiler._prev_schedule_action = torch_profiler.current_action
+        torch_profiler.__enter__()
         return torch_profiler
 
     def build_memory_profiler(

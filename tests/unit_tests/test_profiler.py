@@ -167,6 +167,43 @@ class TestProfilerEnabledPaths(unittest.TestCase):
             with profiler:
                 self.assertIsNotNone(profiler.torch_profiler)
 
+    def test_schedule_is_initialized_before_start(self):
+        import tempfile
+
+        profile_handle = mock.MagicMock()
+        profiler_schedule = mock.Mock(return_value="record")
+
+        def assert_schedule_initialized_before_start():
+            self.assertEqual(profile_handle.step_num, 7)
+            self.assertEqual(profile_handle.current_action, "record")
+
+        profile_handle.__enter__.side_effect = assert_schedule_initialized_before_start
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profiler = Profiler(
+                Profiler.Config(
+                    enable_profiling=True,
+                    profile_freq=4,
+                    profiler_warmup=1,
+                    profiler_active=1,
+                ),
+                global_step=7,
+                base_folder=tmpdir,
+            )
+            with (
+                mock.patch(
+                    "torch.profiler.schedule", return_value=profiler_schedule
+                ) as schedule_factory,
+                mock.patch("torch.profiler.profile", return_value=profile_handle),
+            ):
+                with profiler:
+                    profiler.step()
+
+        schedule_factory.assert_called_once_with(wait=2, warmup=1, active=1)
+        profiler_schedule.assert_called_once_with(7)
+        profile_handle.__enter__.assert_called_once()
+        profile_handle.step.assert_called_once()
+        profile_handle.__exit__.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
