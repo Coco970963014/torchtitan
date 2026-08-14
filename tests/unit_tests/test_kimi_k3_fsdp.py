@@ -10,13 +10,14 @@ from contextlib import nullcontext
 from unittest.mock import patch
 
 import torch
-from torch.distributed._composable.fsdp import FSDPModule
+from torch.distributed._composable.fsdp import FSDPModule, fully_shard
 from torch.distributed.tensor import DTensor
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.distributed import ParallelDims
 
 # Skip instead of failing collection when FLA, a per-model dependency of
@@ -137,6 +138,90 @@ class TestKimiK3FSDP(DTensorTestBase):
             )
             compared_gradients += 1
         self.assertGreater(compared_gradients, 0)
+
+
+class TestKimiK3ChunkedLossFSDP(DTensorTestBase):
+    @property
+    def world_size(self):
+        return 1
+
+    @property
+    def device_type(self):
+        return "cpu"
+
+    @with_comms
+    def test_backward_uses_separate_final_fsdp_units(self):
+        torch.manual_seed(3)
+        config = _small_model_config()
+        with torch.device("meta"):
+            model = config.build()
+        model.to_empty(device=self.device_type)
+        model.init_states()
+
+        parallelism = ParallelismConfig(
+            data_parallel_shard_degree=1,
+            tensor_parallel_degree=1,
+            pipeline_parallel_degree=1,
+            context_parallel_degree=1,
+            expert_parallel_degree=1,
+        )
+        parallel_dims = ParallelDims.from_config(parallelism, world_size=1)
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type",
+            self.device_type,
+        ):
+            parallel_dims.build_mesh()
+        model = parallelize_kimi_k3(
+            model,
+            parallel_dims=parallel_dims,
+            training=TrainingConfig(
+                local_batch_size=1,
+                seq_len=8,
+                steps=1,
+                dtype="bfloat16",
+            ),
+            parallelism=parallelism,
+            compile_config=CompileConfig(),
+            ac_config=None,
+            dump_folder="",
+        )
+
+        assert isinstance(model, KimiK3Model)
+        assert model.norm is not None
+        assert model.lm_head is not None
+        self.assertIsInstance(model.norm, FSDPModule)
+        self.assertIsInstance(model.lm_head, FSDPModule)
+        self.assertIsNot(
+            fully_shard.state(model.norm),
+            fully_shard.state(model.lm_head),
+        )
+
+        model._skip_lm_head = True
+        loss_fn = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(
+                num_chunks=4,
+                loss_fn=CrossEntropyLoss.Config(global_vocab_size=32),
+            )
+        )
+        loss_fn.set_lm_head(model.lm_head)
+        tokens = torch.tensor(
+            [[1, 2, 3, 4, 5, 6, 7, 8]],
+            dtype=torch.long,
+            device=self.device_type,
+        )
+        labels = torch.tensor(
+            [[2, 3, 4, 5, 6, 7, 8, 9]],
+            dtype=torch.long,
+            device=self.device_type,
+        )
+
+        hidden_states = model(tokens=tokens)
+        loss, _ = loss_fn(hidden_states, labels, global_valid_tokens=8.0)
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(model.norm.weight.grad)
+        self.assertIsNotNone(model.lm_head.weight.grad)
 
 
 class TestKimiK3MixedModalityFSDP(DTensorTestBase):
