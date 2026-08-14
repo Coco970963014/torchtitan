@@ -10,7 +10,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Literal
 
 import torch
 import tyro
@@ -122,6 +122,9 @@ class Profiler(Configurable):
     class Config(Configurable.Config):
         enable_profiling: bool = False
         """Whether to enable pytorch profiler."""
+
+        profiler_backend: Literal["torch", "torch_npu"] = "torch"
+        """Profiler implementation to use when profiling is enabled."""
 
         save_traces_folder: str = PROFILE_DIR
         """Trace files location."""
@@ -280,6 +283,10 @@ class Profiler(Configurable):
         )
 
         rank = torch.distributed.get_rank()
+        if cfg.profiler_backend == "torch_npu" and cfg.trace_post_processor is not None:
+            raise ValueError(
+                "trace_post_processor is not supported by the torch_npu backend"
+            )
         post_processor = (
             cfg.trace_post_processor.build() if cfg.trace_post_processor else None
         )
@@ -322,22 +329,56 @@ class Profiler(Configurable):
         assert (
             wait >= 0
         ), "profile_freq must be greater than or equal to warmup + active"
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        elif torch.xpu.is_available():
-            activities.append(torch.profiler.ProfilerActivity.XPU)
+        profiler_kwargs = {}
+        if cfg.profiler_backend == "torch":
+            profiler_api = torch.profiler
+            activities = [profiler_api.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(profiler_api.ProfilerActivity.CUDA)
+            elif torch.xpu.is_available():
+                activities.append(profiler_api.ProfilerActivity.XPU)
+            on_trace_ready = trace_handler
+        elif cfg.profiler_backend == "torch_npu":
+            try:
+                import torch_npu
+            except ImportError as exc:
+                raise RuntimeError(
+                    "profiler_backend=torch_npu requires the torch_npu package"
+                ) from exc
 
-        torch_profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(
-                wait=wait, warmup=warmup, active=active, **additional_params
-            ),
-            on_trace_ready=trace_handler,
-            record_shapes=True,
+            profiler_api = torch_npu.profiler
+            activities = [
+                profiler_api.ProfilerActivity.CPU,
+                profiler_api.ProfilerActivity.NPU,
+            ]
+            npu_trace_dir = (
+                os.path.join(trace_dir, leaf_folder) if leaf_folder else trace_dir
+            )
+            on_trace_ready = profiler_api.tensorboard_trace_handler(
+                npu_trace_dir, worker_name=f"rank{rank}"
+            )
+            profiler_kwargs["experimental_config"] = profiler_api._ExperimentalConfig(
+                profiler_level=profiler_api.ProfilerLevel.Level1,
+                aic_metrics=profiler_api.AiCMetrics.PipeUtilization,
+            )
+        else:
+            raise ValueError(f"Unsupported profiler backend: {cfg.profiler_backend}")
+
+        profiler_schedule = profiler_api.schedule(
+            wait=wait, warmup=warmup, active=active, **additional_params
         )
-        torch_profiler.__enter__()
+        torch_profiler = profiler_api.profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=on_trace_ready,
+            record_shapes=True,
+            **profiler_kwargs,
+        )
         torch_profiler.step_num = global_step
+        torch_profiler.current_action = profiler_schedule(global_step)
+        if hasattr(torch_profiler, "_prev_schedule_action"):
+            torch_profiler._prev_schedule_action = torch_profiler.current_action
+        torch_profiler.__enter__()
         return torch_profiler
 
     def build_memory_profiler(
