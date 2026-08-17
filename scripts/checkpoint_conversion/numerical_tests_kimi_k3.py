@@ -23,6 +23,10 @@ Usage:
     CUDA_VISIBLE_DEVICES=0 python -m \
         scripts.checkpoint_conversion.numerical_tests_kimi_k3 \
         --hf_model_path ~/hf_assets/moonshotai/Kimi-K3 --dtype float32
+
+Add ``--force-hf-routing`` to force the TorchTitan MoE routers onto the expert
+selections the HuggingFace model recorded (diagnostic: removes the routing-flip
+divergence so the reported logit gap is purely the non-routing math).
 """
 
 import argparse
@@ -52,6 +56,14 @@ _MAX_PATCHES_PER_SIDE = 512
 _PROMPT = (
     "<|kimi_image_placeholder|>\n" "What is shown in this image? Describe it briefly."
 )
+
+
+def _empty_device_cache(device: torch.device) -> None:
+    """Release the device memory pool (CUDA or Ascend NPU)."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "npu":
+        torch.npu.empty_cache()
 
 
 def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
@@ -109,7 +121,7 @@ def _reduce_hf_config(hf_config, tt_config, hf_model_path: str) -> None:
             "kda_layers": kda_layers,
             "head_dim": kda.head_dim,
             "num_heads": kda.num_heads,
-            "short_conv_kernel_size": kda.conv_kernel_size,
+            "short_conv_kernel_size": kda.q_conv.kernel_size,
             "gate_lower_bound": kda.kernel.lower_bound,
             "use_full_rank_gate": True,
         },
@@ -240,7 +252,7 @@ def run_hf(
         "expert_indices": expert_indices,
     }
     del model
-    torch.cuda.empty_cache()
+    _empty_device_cache(device)
     return ref
 
 
@@ -293,6 +305,51 @@ def _print_routing_comparison(
         num_routings += hf_ids.numel()
     match_rate = num_matching / num_routings if num_routings else 0.0
     print(f"router choices: {num_matching}/{num_routings} match " f"({match_rate:.1%})")
+
+
+def _force_hf_routing(
+    model: KimiK3Model,
+    expert_indices: dict[int, torch.Tensor],
+) -> int:
+    """Monkeypatch each TorchTitan MoE router to use HF's recorded top-k experts.
+
+    Diagnostic: the TT routers compute their own gating weights at exactly the
+    experts HF chose (via the real TT scores), so the discrete routing-flip
+    divergence is removed and any residual is the non-routing math (attention /
+    expert FFN / fp). ``expert_indices`` maps the HF layer index to a
+    ``(num_tokens, top_k)`` LongTensor recorded during ``run_hf``.
+    """
+    forced = 0
+    for key, layer in model.layers.items():
+        layer_idx = int(key)
+        if layer.moe is None or layer_idx not in expert_indices:
+            continue
+        ids = expert_indices[layer_idx].detach().cpu()
+        router = layer.moe.router
+        orig = router.forward
+
+        def forced_forward(
+            x_BLD,
+            expert_bias_E=None,
+            _r=router,
+            _o=orig,
+            _ids=ids,
+        ):
+            # Reuse the real score computation; override only the selection.
+            _, _, scores_BLE = _o(x_BLD, expert_bias_E)
+            B, L, _ = scores_BLE.shape
+            ids_BLK = _ids.to(scores_BLE.device)
+            if ids_BLK.ndim == 2:
+                ids_BLK = ids_BLK.view(B, L, -1)
+            topk_BLK = scores_BLE.gather(dim=-1, index=ids_BLK)
+            if _r.route_norm:
+                topk_BLK = topk_BLK / (topk_BLK.sum(dim=-1, keepdim=True) + 1e-20)
+            topk_BLK = topk_BLK * _r.route_scale
+            return topk_BLK, ids_BLK, scores_BLE
+
+        router.forward = forced_forward
+        forced += 1
+    return forced
 
 
 @torch.no_grad()
@@ -432,12 +489,22 @@ def main() -> None:
         choices=["float32", "bfloat16", "float16"],
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--force-hf-routing",
+        action="store_true",
+        help="Force the TorchTitan MoE routers to use HF's recorded expert "
+        "selections (removes routing-flip divergence; isolates the non-routing "
+        "math).",
+    )
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        parser.error("Kimi K3 numerical parity requires a CUDA GPU.")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif getattr(torch, "npu", None) is not None and torch.npu.is_available():
+        device = torch.device("npu")
+    else:
+        parser.error("Kimi K3 numerical parity requires a CUDA or Ascend NPU device.")
 
-    device = torch.device("cuda")
     dtype = getattr(torch, args.dtype)
     vision_dtype = getattr(torch, args.vision_dtype) if args.vision_dtype else dtype
     hf_dtype = getattr(torch, args.hf_dtype)
@@ -462,6 +529,11 @@ def main() -> None:
         device,
     )
     del hf_state_dict
+
+    if args.force_hf_routing:
+        n = _force_hf_routing(tt_model, ref["expert_indices"])
+        print(f"forced HF routing on {n} TT MoE layers")
+
     tt_logits = run_tt(tt_model, ref, vision_dtype, device)
     if not compare(ref["last_logits"], tt_logits):
         raise SystemExit(1)

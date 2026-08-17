@@ -16,13 +16,16 @@ speed; the pure-PyTorch recurrence it is checked against lives in
 from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 
+from fla.modules import ShortConvolution
+from fla.modules.conv.causal_conv1d import causal_conv1d
+from fla.modules.fused_norm_gate import rms_norm_gated
+from fla.ops.attnres import fused_attnres
 from fla.ops.kda import chunk_kda
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from torchtitan.models.common import Conv1d, Linear
+from torchtitan.models.common import Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     BaseAttention,
@@ -47,8 +50,49 @@ from torchtitan.protocols.module import Module
 # T = flattened tokens, N = attention-residual entries.
 
 
+class KimiShortConvolution(ShortConvolution, Module):
+    """KDA short causal convolution backed by FLA's fused kernel.
+
+    Matches the released Kimi K3 HuggingFace model, which builds FLA's
+    ``ShortConvolution`` per q/k/v projection. The Triton kernel runs only on
+    accelerator devices.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hidden_size: int
+        kernel_size: int
+        activation: str = "silu"
+
+    def __init__(self, config: Config):
+        super().__init__(
+            hidden_size=config.hidden_size,
+            kernel_size=config.kernel_size,
+            activation=config.activation,
+        )
+
+    def forward(
+        self,
+        x_BLD: torch.Tensor,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, None]:
+        y_BLD, _ = causal_conv1d(
+            x=x_BLD,
+            weight=self.weight.squeeze(1),
+            activation=self.activation,
+            backend=self.backend,
+        )
+        return y_BLD, None
+
+
 class KimiRMSNormGated(Module):
-    """Per-head RMSNorm followed by a sigmoid output gate."""
+    """Per-head RMSNorm followed by a sigmoid output gate.
+
+    Wraps the FLA functional ``rms_norm_gated`` behind the torchtitan
+    ``Module`` protocol so it participates in ``init_states``/``param_init``.
+    The wrapper owns the weight (ones-initialized, weight-only checkpoint
+    schema unchanged); the fused kernel receives it with ``bias=None``.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -61,12 +105,14 @@ class KimiRMSNormGated(Module):
         self.weight = nn.Parameter(torch.empty(config.dim))
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_float = x_float * torch.rsqrt(variance + self.eps)
-        x_float = self.weight.float() * x_float
-        return (x_float * torch.sigmoid(gate.float())).to(input_dtype)
+        return rms_norm_gated(
+            x,
+            gate,
+            self.weight,
+            None,
+            activation="sigmoid",
+            eps=self.eps,
+        )
 
 
 class KimiFeedForward(FeedForward):
@@ -258,13 +304,12 @@ class KimiDeltaAttention(Module):
         dim: int
         num_heads: int
         head_dim: int
-        conv_kernel_size: int
         q_proj: Linear.Config
         k_proj: Linear.Config
         v_proj: Linear.Config
-        q_conv: Conv1d.Config
-        k_conv: Conv1d.Config
-        v_conv: Conv1d.Config
+        q_conv: KimiShortConvolution.Config
+        k_conv: KimiShortConvolution.Config
+        v_conv: KimiShortConvolution.Config
         forget_a: Linear.Config
         forget_b: Linear.Config
         beta: Linear.Config
@@ -280,7 +325,6 @@ class KimiDeltaAttention(Module):
         super().__init__()
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
-        self.conv_kernel_size = config.conv_kernel_size
 
         self.q_proj = config.q_proj.build()
         self.k_proj = config.k_proj.build()
@@ -299,10 +343,6 @@ class KimiDeltaAttention(Module):
         self.A_log = nn.Parameter(torch.empty(config.num_heads))
         self.dt_bias = nn.Parameter(torch.empty(config.num_heads, config.head_dim))
 
-    def _causal_conv(self, x_BLC: torch.Tensor, conv: Conv1d) -> torch.Tensor:
-        x_BCL = F.pad(x_BLC.transpose(1, 2), (self.conv_kernel_size - 1, 0))
-        return F.silu(conv(x_BCL)).transpose(1, 2)
-
     def forward(
         self,
         x_BLD: torch.Tensor,
@@ -316,13 +356,13 @@ class KimiDeltaAttention(Module):
             )
 
         B, L, _ = x_BLD.shape
-        q_BLHK = self._causal_conv(self.q_proj(x_BLD), self.q_conv).view(
+        q_BLHK = self.q_conv(self.q_proj(x_BLD))[0].view(
             B, L, self.num_heads, self.head_dim
         )
-        k_BLHK = self._causal_conv(self.k_proj(x_BLD), self.k_conv).view(
+        k_BLHK = self.k_conv(self.k_proj(x_BLD))[0].view(
             B, L, self.num_heads, self.head_dim
         )
-        v_BLHV = self._causal_conv(self.v_proj(x_BLD), self.v_conv).view(
+        v_BLHV = self.v_conv(self.v_proj(x_BLD))[0].view(
             B, L, self.num_heads, self.head_dim
         )
         forget_BLHK = self.forget_b(self.forget_a(x_BLD)).view(
@@ -406,6 +446,61 @@ class KimiGroupedExperts(GroupedExperts):
 
         return torch._grouped_mm(
             h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
+        ).type_as(x_RD)
+
+
+class KimiGroupedExpertsFp32(KimiGroupedExperts):
+    """``KimiGroupedExperts`` with the grouped GEMMs running in the input dtype.
+
+    The base ``KimiGroupedExperts.forward`` hardcodes ``.bfloat16()`` on every
+    grouped GEMM, which quantizes the expert matmuls even when the model runs
+    in float32. This subclass follows the routed-input dtype instead, so under
+    a float32 model the expert computation stays in float32 (and under bf16 it
+    is the identity, keeping training numerics unchanged). It exists as a
+    reference to measure the precision cost of the hardcoded bf16 path; it is
+    not part of the default model construction.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(KimiGroupedExperts.Config):
+        pass
+
+    def forward(
+        self,
+        x_RD: torch.Tensor,
+        num_tokens_per_expert_E: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.w1_EFD, DTensor):
+            w1_EFD = self.w1_EFD.to_local()
+            assert isinstance(self.w2_EDF, DTensor)
+            w2_EDF = self.w2_EDF.to_local()
+            assert isinstance(self.w3_EFD, DTensor)
+            w3_EFD = self.w3_EFD.to_local()
+        else:
+            w1_EFD = self.w1_EFD
+            w2_EDF = self.w2_EDF
+            w3_EFD = self.w3_EFD
+
+        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+        input_dtype = x_RD.dtype
+
+        gate_RF = torch._grouped_mm(
+            x_RD.to(input_dtype), w1_EFD.to(input_dtype).transpose(-2, -1), offs=offsets_E
+        )
+        up_RF = torch._grouped_mm(
+            x_RD.to(input_dtype), w3_EFD.to(input_dtype).transpose(-2, -1), offs=offsets_E
+        )
+
+        input_dtype = gate_RF.dtype
+        gate_RF = gate_RF.float()
+        up_RF = up_RF.float()
+        gate_RF = self.beta * torch.tanh(gate_RF / self.beta) * torch.sigmoid(gate_RF)
+        if self.linear_beta is not None:
+            up_RF = self.linear_beta * torch.tanh(up_RF / self.linear_beta)
+        h_RF = (gate_RF * up_RF).to(input_dtype)
+
+        return torch._grouped_mm(
+            h_RF, w2_EDF.to(input_dtype).transpose(-2, -1), offs=offsets_E
         ).type_as(x_RD)
 
 
@@ -515,17 +610,26 @@ def _apply_attention_residual(
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual in FP32."""
+    """Apply Kimi's block-level attention residual with FLA's fused kernel.
 
-    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
-    values_float = values_TND.float()
-    variance = values_float.pow(2).mean(dim=-1, keepdim=True)
-    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
-    score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
-    probs_TN = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
-    output_TD = torch.matmul(probs_TN, values_float).squeeze(1)
-    return output_TD.to(values_TND.dtype)
+    The block residuals come first (index 0..N-1) and the running prefix sum is
+    the last residual source, matching the released eager concatenation order.
+    FLA's ``fused_attnres`` computes the per-source RMSNorm key normalization
+    and the depth softmax in fp32, same as the eager reference.
+    """
+
+    residuals = [
+        block_residual_TND[:, i, :].contiguous()
+        for i in range(block_residual_TND.shape[1])
+    ]
+    residuals.append(prefix_sum_TD)
+    return fused_attnres(
+        query=projection.weight.squeeze(0),
+        residuals=residuals,
+        rms_weight=norm.weight,
+        rms_eps=norm.eps,
+        scale=1.0,
+    )
 
 
 class KimiK3TransformerBlock(Module):
