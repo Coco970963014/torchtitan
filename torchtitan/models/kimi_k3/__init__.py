@@ -26,7 +26,6 @@ from .model import (
     KimiDeltaAttention,
     KimiFeedForward,
     KimiGroupedExperts,
-    KimiGroupedExpertsFp32,
     KimiK3Model,
     KimiK3TransformerBlock,
     KimiKDAKernel,
@@ -228,7 +227,6 @@ def _latent_moe_config(
     num_experts: int,
     top_k: int,
     num_shared_experts: int,
-    routed_experts_cls: type = KimiGroupedExperts,
 ) -> KimiLatentMoE.Config:
     return KimiLatentMoE.Config(
         num_experts=num_experts,
@@ -241,7 +239,7 @@ def _latent_moe_config(
             route_scale=1.0,
         ),
         routed_down=_linear(dim, latent_dim),
-        routed_experts=routed_experts_cls.Config(
+        routed_experts=KimiGroupedExperts.Config(
             dim=latent_dim,
             hidden_dim=expert_hidden_dim,
             num_experts=num_experts,
@@ -374,7 +372,6 @@ def _kimi_k3_config(
     top_k: int,
     num_shared_experts: int,
     vision_encoder: KimiK3VisionEncoder.Config,
-    routed_experts_cls: type = KimiGroupedExperts,
 ) -> KimiK3Model.Config:
     """Assemble a Kimi K3 config from the released topology's free parameters.
 
@@ -428,7 +425,6 @@ def _kimi_k3_config(
                         num_experts=num_experts,
                         top_k=top_k,
                         num_shared_experts=num_shared_experts,
-                        routed_experts_cls=routed_experts_cls,
                     )
                 ),
                 attention_norm=_norm(dim),
@@ -464,7 +460,6 @@ def _kimi_k3_config(
 
 def _debugmodel(
     attn_backend: str,
-    routed_experts_cls: type = KimiGroupedExperts,
 ) -> KimiK3Model.Config:
     """Return the topology-complete Kimi K3 debug model.
 
@@ -506,106 +501,10 @@ def _debugmodel(
             num_layers=4,
             num_heads=3,
         ),
-        routed_experts_cls=routed_experts_cls,
     )
-
-
-def _1bmodel(
-    attn_backend: str,
-    routed_experts_cls: type = KimiGroupedExperts,
-) -> KimiK3Model.Config:
-    """Return a ~1B Kimi K3 configuration (dim=1280, 20 layers, 16 experts)."""
-    if attn_backend != "eager":
-        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
-    return _kimi_k3_config(
-        dim=1280,
-        vocab_size=163840,
-        num_layers=20,
-        full_attention_layers={4, 8, 12, 16, 20},
-        attn_res_block_size=12,
-        num_heads=16,
-        q_lora_rank=512,
-        kv_lora_rank=256,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        kda_head_dim=80,
-        conv_kernel_size=4,
-        dense_hidden_dim=3584,
-        latent_dim=320,
-        expert_hidden_dim=704,
-        num_experts=16,
-        top_k=2,
-        num_shared_experts=2,
-        vision_encoder=_vision_encoder_config(
-            text_dim=1280,
-            dim=1024,
-            qkv_dim=1536,
-            hidden_dim=4096,
-            num_layers=4,
-            num_heads=16,
-        ),
-        routed_experts_cls=routed_experts_cls,
-    )
-
-
-def _halfbmodel(
-    attn_backend: str,
-    routed_experts_cls: type = KimiGroupedExperts,
-) -> KimiK3Model.Config:
-    """Return a ~0.5B Kimi K3 configuration (dim=896, 16 layers, 16 experts).
-
-    Intermediate size between ``debugmodel`` (~100M) and ``1bmodel`` (~1B),
-    used to test whether the hardcoded-bf16-expert precision gap grows with
-    parameter count.
-    """
-    if attn_backend != "eager":
-        raise ValueError("Kimi K3 v1 only provides the 'eager' backend.")
-    return _kimi_k3_config(
-        dim=896,
-        vocab_size=163840,
-        num_layers=16,
-        full_attention_layers={4, 8, 12, 16},
-        attn_res_block_size=12,
-        num_heads=14,
-        q_lora_rank=384,
-        kv_lora_rank=192,
-        qk_nope_head_dim=64,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        kda_head_dim=64,
-        conv_kernel_size=4,
-        dense_hidden_dim=2560,
-        latent_dim=224,
-        expert_hidden_dim=448,
-        num_experts=16,
-        top_k=2,
-        num_shared_experts=2,
-        vision_encoder=_vision_encoder_config(
-            text_dim=896,
-            dim=768,
-            qkv_dim=1152,
-            hidden_dim=3072,
-            num_layers=4,
-            num_heads=16,
-        ),
-        routed_experts_cls=routed_experts_cls,
-    )
-
 
 kimi_k3_configs = {
     "debugmodel": _debugmodel,
-    "debugmodel_fp32experts": lambda attn_backend: _debugmodel(
-        attn_backend, routed_experts_cls=KimiGroupedExpertsFp32
-    ),
-    "halfbmodel": lambda attn_backend: _halfbmodel(attn_backend),
-    "halfbmodel_fp32experts": lambda attn_backend: _halfbmodel(
-        attn_backend, routed_experts_cls=KimiGroupedExpertsFp32
-    ),
-    "1bmodel": lambda attn_backend: _1bmodel(attn_backend),
-    "1bmodel_fp32experts": lambda attn_backend: _1bmodel(
-        attn_backend, routed_experts_cls=KimiGroupedExpertsFp32
-    ),
 }
 
 

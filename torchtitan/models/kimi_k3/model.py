@@ -449,61 +449,6 @@ class KimiGroupedExperts(GroupedExperts):
         ).type_as(x_RD)
 
 
-class KimiGroupedExpertsFp32(KimiGroupedExperts):
-    """``KimiGroupedExperts`` with the grouped GEMMs running in the input dtype.
-
-    The base ``KimiGroupedExperts.forward`` hardcodes ``.bfloat16()`` on every
-    grouped GEMM, which quantizes the expert matmuls even when the model runs
-    in float32. This subclass follows the routed-input dtype instead, so under
-    a float32 model the expert computation stays in float32 (and under bf16 it
-    is the identity, keeping training numerics unchanged). It exists as a
-    reference to measure the precision cost of the hardcoded bf16 path; it is
-    not part of the default model construction.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(KimiGroupedExperts.Config):
-        pass
-
-    def forward(
-        self,
-        x_RD: torch.Tensor,
-        num_tokens_per_expert_E: torch.Tensor,
-    ) -> torch.Tensor:
-        if isinstance(self.w1_EFD, DTensor):
-            w1_EFD = self.w1_EFD.to_local()
-            assert isinstance(self.w2_EDF, DTensor)
-            w2_EDF = self.w2_EDF.to_local()
-            assert isinstance(self.w3_EFD, DTensor)
-            w3_EFD = self.w3_EFD.to_local()
-        else:
-            w1_EFD = self.w1_EFD
-            w2_EDF = self.w2_EDF
-            w3_EFD = self.w3_EFD
-
-        offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        input_dtype = x_RD.dtype
-
-        gate_RF = torch._grouped_mm(
-            x_RD.to(input_dtype), w1_EFD.to(input_dtype).transpose(-2, -1), offs=offsets_E
-        )
-        up_RF = torch._grouped_mm(
-            x_RD.to(input_dtype), w3_EFD.to(input_dtype).transpose(-2, -1), offs=offsets_E
-        )
-
-        input_dtype = gate_RF.dtype
-        gate_RF = gate_RF.float()
-        up_RF = up_RF.float()
-        gate_RF = self.beta * torch.tanh(gate_RF / self.beta) * torch.sigmoid(gate_RF)
-        if self.linear_beta is not None:
-            up_RF = self.linear_beta * torch.tanh(up_RF / self.linear_beta)
-        h_RF = (gate_RF * up_RF).to(input_dtype)
-
-        return torch._grouped_mm(
-            h_RF, w2_EDF.to(input_dtype).transpose(-2, -1), offs=offsets_E
-        ).type_as(x_RD)
-
-
 class KimiLatentMoE(Module):
     """Eager trainable implementation of Kimi K3 latent MoE."""
 
