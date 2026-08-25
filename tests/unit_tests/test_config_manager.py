@@ -130,6 +130,23 @@ class TestConfigManager(unittest.TestCase):
         )
         assert config.dump_folder == "/tmp/test_tt/"
 
+    def test_cli_override_profiler_backend(self):
+        """CLI args select the optional NPU profiler backend."""
+        config_manager = ConfigManager()
+        config = config_manager.parse_args(
+            [
+                "--module",
+                "llama3",
+                "--config",
+                "llama3_debugmodel",
+                "--profiler.enable_profiling",
+                "--profiler.profiler_backend",
+                "torch_npu",
+            ]
+        )
+        assert config.profiler.enable_profiling
+        assert config.profiler.profiler_backend == "torch_npu"
+
     def test_parse_module_fqns_per_model_part(self):
         """module_fqns_per_model_part defaults to None."""
         config_manager = ConfigManager()

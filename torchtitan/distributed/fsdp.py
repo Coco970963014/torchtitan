@@ -120,6 +120,7 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     enable_symm_mem: bool = False,
+    separate_norm_and_lm_head: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -161,6 +162,9 @@ def apply_fsdp_to_decoder(
             used by routed experts. ``None`` outside full_dtensor.
         enable_symm_mem (bool): Whether to enable symmetric-memory FSDP
             communication.
+        separate_norm_and_lm_head (bool): Whether to put the final norm and
+            lm_head in separate FSDP units. This is required when they run in
+            separate forward/backward passes, such as with chunked loss.
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -200,11 +204,15 @@ def apply_fsdp_to_decoder(
         # As an optimization, do not reshard_after_forward the last layers
         # by default since FSDP would prefetch them immediately.
         if model.norm is not None and model.lm_head is not None:
-            fully_shard(
-                [model.norm, model.lm_head],
+            final_module_config = {
                 **fsdp_config,
-                reshard_after_forward=reshard_after_forward_policy == "always",
-            )
+                "reshard_after_forward": reshard_after_forward_policy == "always",
+            }
+            if separate_norm_and_lm_head:
+                fully_shard(model.norm, **final_module_config)
+                fully_shard(model.lm_head, **final_module_config)
+            else:
+                fully_shard([model.norm, model.lm_head], **final_module_config)
 
     for layer_id, transformer_block in model.layers.items():
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
