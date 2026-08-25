@@ -727,6 +727,23 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         return inputs, labels, extra_kwargs
 
+    def _log_memory_stage(self, stage: str) -> None:
+        """Log allocator state after a synchronized training phase boundary."""
+        utils.device_module.synchronize()
+        stats = utils.device_module.memory_stats(self.device)
+        mib = 1024 * 1024
+        logger.info(
+            "memory_stage step=%d rank=%d stage=%s active_mib=%.2f "
+            "reserved_mib=%.2f peak_active_mib=%.2f peak_reserved_mib=%.2f",
+            self.step,
+            torch.distributed.get_rank(),
+            stage,
+            stats.get("active_bytes.all.current", -1) / mib,
+            stats.get("reserved_bytes.all.current", -1) / mib,
+            stats.get("active_bytes.all.peak", -1) / mib,
+            stats.get("reserved_bytes.all.peak", -1) / mib,
+        )
+
     @sl.log_trace_span("fwd_bwd")
     def forward_backward_step(
         self,
@@ -754,6 +771,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         assert len(model_parts) == 1
         with self.train_context():
             pred = model_parts[0](inputs, **extra_kwargs)
+            self._log_memory_stage("after_forward")
             loss_kwargs = {}
             if "positions" in extra_kwargs:
                 loss_kwargs["positions"] = extra_kwargs["positions"]
@@ -768,6 +786,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # this propagates types through BWD, causing unnecessary conflicts
                 # between torch_function and internals (e.g. AC). FWD is sufficient.
                 loss.backward()
+            self._log_memory_stage("after_backward")
 
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
@@ -881,6 +900,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
             self.lr_schedulers.step()
+        self._log_memory_stage("after_optimizer")
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
