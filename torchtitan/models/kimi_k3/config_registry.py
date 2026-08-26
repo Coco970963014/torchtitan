@@ -19,6 +19,8 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MM_DATASETS,
     MultiModalProcessor,
 )
+from torchtitan.models.common.attention import ScaledDotProductAttention
+from torchtitan.models.common.vision_encoder import VisionScaledDotProductAttention
 from torchtitan.hf_datasets.multimodal.utils.image import resize_to_patch_budget
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
@@ -94,3 +96,15 @@ def kimi_k3_debugmodel() -> Trainer.Config:
         ),
         activation_checkpoint=SelectiveAC.Config(),
     )
+
+
+def kimi_k3_debugmodel_npu_compat() -> Trainer.Config:
+    """Return the debug model with SDPA backends for the current NPU runtime."""
+    config = kimi_k3_debugmodel()
+    for layer in config.model_spec.model.layers:
+        if layer.attention is not None:
+            layer.attention.inner_attention = ScaledDotProductAttention.Config()
+    config.model_spec.model.vision_encoder.block.attn.inner_attention = (
+        VisionScaledDotProductAttention.Config()
+    )
+    return config

@@ -11,9 +11,12 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.models.kimi_k3 import _kimi_k3_config, _vision_encoder_config
+from torchtitan.models.kimi_k3.config_registry import kimi_k3_debugmodel_npu_compat
 from torchtitan.models.kimi_k3.kda import KimiKDAKernel
 from torchtitan.models.kimi_k3.model import KimiK3Model
 from torchtitan.models.kimi_k3.state_dict_adapter import KimiK3StateDictAdapter
+from torchtitan.models.common.attention import ScaledDotProductAttention
+from torchtitan.models.common.vision_encoder import VisionScaledDotProductAttention
 
 
 def _small_model_config() -> KimiK3Model.Config:
@@ -124,6 +127,27 @@ class TestKimiK3(unittest.TestCase):
         positions = torch.arange(4, dtype=torch.int32)
         attention_masks = model.get_attention_masks(positions)
         self.assertIsInstance(attention_masks, BlockMask)
+
+    def test_npu_compat_config_uses_causal_sdpa_without_masks(self):
+        config = kimi_k3_debugmodel_npu_compat()
+        for layer in config.model_spec.model.layers:
+            if layer.attention is not None:
+                self.assertIsInstance(
+                    layer.attention.inner_attention,
+                    ScaledDotProductAttention.Config,
+                )
+        self.assertIsInstance(
+            config.model_spec.model.vision_encoder.block.attn.inner_attention,
+            VisionScaledDotProductAttention.Config,
+        )
+
+        model_config = _small_model_config()
+        for layer in model_config.layers:
+            if layer.attention is not None:
+                layer.attention.inner_attention = ScaledDotProductAttention.Config()
+        model = model_config.build()
+        positions = torch.arange(4, dtype=torch.int32)
+        self.assertIsNone(model.get_attention_masks(positions))
 
     @unittest.skipIf(not torch.cuda.is_available(), "FLA KDA kernel requires CUDA.")
     def test_fla_kda_kernel_matches_recurrent_reference(self):

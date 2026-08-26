@@ -8,6 +8,7 @@ import unittest
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     GraphTrainerScaledDotProductAttention,
@@ -42,6 +43,24 @@ class TestModelTDLayout(unittest.TestCase):
         out_BLNH = attention(q_BLNH, k_BLNH, v_BLNH, enable_gqa=True)
 
         self.assertEqual(out_BLNH.shape, q_BLNH.shape)
+
+    def test_sdpa_preserves_packed_tnh_layout(self):
+        attention = ScaledDotProductAttention.Config().build()
+        q_TNH = torch.randn(8, 4, 16)
+        k_TNH = torch.randn(8, 4, 16)
+        v_TNV = torch.randn(8, 4, 12)
+
+        out_TNV = attention(q_TNH, k_TNH, v_TNV, scale=0.25)
+        expected_TNV = F.scaled_dot_product_attention(
+            q_TNH.transpose(0, 1).unsqueeze(0),
+            k_TNH.transpose(0, 1).unsqueeze(0),
+            v_TNV.transpose(0, 1).unsqueeze(0),
+            scale=0.25,
+            is_causal=True,
+        ).squeeze(0).transpose(0, 1)
+
+        self.assertEqual(out_TNV.shape, v_TNV.shape)
+        torch.testing.assert_close(out_TNV, expected_TNV)
 
     def test_graph_trainer_sdpa_preserves_tnh_shape(self):
         attention = GraphTrainerScaledDotProductAttention.Config().build()

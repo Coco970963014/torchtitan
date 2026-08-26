@@ -11,7 +11,11 @@ import torch.nn as nn
 from torch.nn.attention.flex_attention import create_block_mask
 
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.vision_encoder import VisionAttention
+from torchtitan.models.common.vision_encoder import (
+    create_block_diagonal_sdpa_mask,
+    VisionAttention,
+    VisionScaledDotProductAttention,
+)
 
 
 class _IdentityAttention(nn.Module):
@@ -59,6 +63,30 @@ class TestVisionAttention(unittest.TestCase):
 
         self.assertEqual(identity_attention.input_shape, (num_tokens, num_heads, 4))
         self.assertEqual(out_TD.shape, (num_tokens, dim))
+
+    def test_sdpa_respects_packed_segments(self) -> None:
+        torch.manual_seed(0)
+        attention = VisionScaledDotProductAttention(
+            VisionScaledDotProductAttention.Config()
+        )
+        q_TNH = torch.randn(4, 2, 3)
+        k_TNH = torch.randn(4, 2, 3)
+        v_TNH = torch.randn(4, 2, 3)
+        attention_mask_TT = create_block_diagonal_sdpa_mask(
+            torch.tensor([2, 2]), total_tokens=4, device=torch.device("cpu")
+        )
+
+        out_TNH = attention(
+            q_TNH, k_TNH, v_TNH, attention_masks=attention_mask_TT
+        )
+        changed_v_TNH = v_TNH.clone()
+        changed_v_TNH[2:] += 100
+        changed_out_TNH = attention(
+            q_TNH, k_TNH, changed_v_TNH, attention_masks=attention_mask_TT
+        )
+
+        torch.testing.assert_close(out_TNH[:2], changed_out_TNH[:2])
+        self.assertFalse(torch.allclose(out_TNH[2:], changed_out_TNH[2:]))
 
 
 if __name__ == "__main__":

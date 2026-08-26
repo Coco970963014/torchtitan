@@ -92,6 +92,7 @@ def parallelize_kimi_k3(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=1,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        separate_norm_and_lm_head=True,
     )
 
     return model

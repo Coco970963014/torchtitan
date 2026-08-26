@@ -357,8 +357,11 @@ class Decoder(BaseModel):
             return self._create_flex_attention_mask_for_document(positions, attn_config)
         elif isinstance(inner_attn, VarlenAttention.Config):
             return create_varlen_metadata_for_document(positions)
+        elif isinstance(inner_attn, ScaledDotProductAttention.Config):
+            return None
         else:
             raise TypeError(
-                f"Only VarlenAttention and FlexAttention support attention masks, "
+                "Only ScaledDotProductAttention, VarlenAttention, and "
+                "FlexAttention support attention masks, "
                 f"got {type(inner_attn).__name__}"
             )
