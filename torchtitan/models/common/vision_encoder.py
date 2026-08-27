@@ -24,6 +24,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
 from torchtitan.models.common import Linear
@@ -66,6 +68,62 @@ def create_block_diagonal_mask(
     )
 
 
+def create_block_diagonal_sdpa_mask(
+    segment_lengths: torch.Tensor,
+    total_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create an exact dense block-diagonal mask for packed visual segments."""
+    segment_ids_T = torch.repeat_interleave(
+        torch.arange(segment_lengths.shape[0], device=device, dtype=torch.int32),
+        segment_lengths.to(device=device, dtype=torch.int32),
+        output_size=total_tokens,
+    )
+    return segment_ids_T[:, None] == segment_ids_T[None, :]
+
+
+class VisionScaledDotProductAttention(Module):
+    """Non-causal SDPA over packed visual segments with a dense segment mask."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    sdpa_backends = [
+        SDPBackend.CUDNN_ATTENTION,
+        SDPBackend.FLASH_ATTENTION,
+        SDPBackend.MATH,
+    ]
+
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+
+    def forward(
+        self,
+        q_TNH: torch.Tensor,
+        k_TNH: torch.Tensor,
+        v_TNH: torch.Tensor,
+        *,
+        attention_masks: torch.Tensor,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        q_NTH, k_NTH, v_NTH = (
+            q_TNH.transpose(0, 1),
+            k_TNH.transpose(0, 1),
+            v_TNH.transpose(0, 1),
+        )
+        with sdpa_kernel(self.sdpa_backends, set_priority=True):
+            out_NTH = F.scaled_dot_product_attention(
+                q_NTH,
+                k_NTH,
+                v_NTH,
+                attn_mask=attention_masks,
+                scale=scale,
+                is_causal=False,
+            )
+        return out_NTH.transpose(0, 1)
+
+
 class VisionMLP(Module):
     """Feed-forward network with GELU activation (fc1 -> act -> fc2)."""
 
@@ -88,7 +146,7 @@ class VisionMLP(Module):
 
 
 class VisionAttention(Module):
-    """Multi-head self-attention with FlexAttention over visual patches.
+    """Multi-head self-attention over visual patches.
 
     Separate q/k/v projections (clean per-head ColwiseParallel under TP). RoPE is
     applied via the injected ``rope_apply`` callable so this class is reused
@@ -126,7 +184,7 @@ class VisionAttention(Module):
         *,
         rope_cache: torch.Tensor,
         rope_apply: RopeApply,
-        attention_mask: BlockMask,
+        attention_mask: BlockMask | torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = x.shape[0]
 
@@ -169,7 +227,7 @@ class VisionTransformerBlock(Module):
         *,
         rope_cache: torch.Tensor,
         rope_apply: RopeApply,
-        attention_mask: BlockMask,
+        attention_mask: BlockMask | torch.Tensor,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),

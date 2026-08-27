@@ -33,6 +33,28 @@ import torch
 
 
 @dataclass(kw_only=True, slots=True)
+class ActivationOffloadConfig:
+    """Saved-activation CPU offload policy for the P0 swap experiment."""
+
+    pin_memory: bool = True
+    """Allocate pinned host buffers when supported by the device backend."""
+
+    device_type: str = "npu"
+    """Device type whose saved tensors are offloaded to host memory."""
+
+
+@dataclass(kw_only=True, slots=True)
+class ActivationOffloadConfig:
+    """Saved-activation CPU offload policy for the P0 swap experiment."""
+
+    pin_memory: bool = True
+    """Allocate pinned host buffers when supported by the device backend."""
+
+    device_type: str = "npu"
+    """Device type whose saved tensors are offloaded to host memory."""
+
+
+@dataclass(kw_only=True, slots=True)
 class TrainingConfig:
     num_tokens_per_microbatch_per_dp_rank: int = 16384
     """
@@ -72,6 +94,18 @@ class TrainingConfig:
     enable_cpu_offload: bool = False
     """
     Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP
+    """
+
+    activation_offload: ActivationOffloadConfig | None = None
+    """
+    Optional saved-activation CPU offload policy. Distinct from FSDP parameter
+    CPU offload; only models that opt in support it.
+    """
+
+    activation_offload: ActivationOffloadConfig | None = None
+    """
+    Optional saved-activation CPU offload policy. Distinct from FSDP parameter
+    CPU offload; only models that opt in support it.
     """
 
     disable_cuda_graphs: bool = False

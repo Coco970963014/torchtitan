@@ -14,6 +14,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.activation_offload import apply_activation_offload
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_vision_encoder,
@@ -55,6 +56,13 @@ def parallelize_kimi_k3(
         )
     if compile_config.enable and "model" in compile_config.components:
         raise NotImplementedError("Kimi K3 does not support model compilation yet.")
+    if training.activation_offload is not None:
+        if ac_config is not None:
+            raise NotImplementedError(
+                "Kimi K3 activation offload P0 cannot be combined with activation "
+                "checkpointing. Run each activation-memory feature independently."
+            )
+        apply_activation_offload(model, config=training.activation_offload)
 
     dp_mesh_names = (
         ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
@@ -92,6 +100,7 @@ def parallelize_kimi_k3(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=1,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        separate_norm_and_lm_head=True,
     )
 
     return model

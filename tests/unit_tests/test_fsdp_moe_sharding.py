@@ -5,8 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
+import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -70,6 +72,38 @@ def _get_expert_shard_dim(model: Qwen3Model) -> int | None:
                         if isinstance(p, Shard):
                             return p.dim
     return None
+
+
+class _DecoderWithSeparateOutputModules(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.enable_weight_tying = False
+        self.tok_embeddings = None
+        self.norm = nn.Linear(2, 2)
+        self.lm_head = nn.Linear(2, 2)
+        self.layers = nn.ModuleDict()
+
+
+class TestApplyFsdpOutputModules(unittest.TestCase):
+    def test_separate_norm_and_lm_head_use_distinct_fsdp_units(self) -> None:
+        model = _DecoderWithSeparateOutputModules()
+        dp_mesh = Mock()
+        dp_mesh.mesh_dim_names = ()
+        with patch("torchtitan.distributed.fsdp.fully_shard") as fully_shard:
+            apply_fsdp_to_decoder(
+                model,
+                dp_mesh=dp_mesh,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                pp_enabled=False,
+                separate_norm_and_lm_head=True,
+            )
+
+        self.assertEqual(
+            fully_shard.call_args_list[0].args[0],
+            model.norm,
+        )
+        self.assertEqual(fully_shard.call_args_list[1].args[0], model.lm_head)
 
 
 class TestApplyFsdpMoESharding(DTensorTestBase):

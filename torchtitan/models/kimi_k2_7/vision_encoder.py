@@ -31,6 +31,8 @@ from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
 from torchtitan.models.common.rope import _maybe_wrap_positions, ComplexRoPE
 from torchtitan.models.common.vision_encoder import (
     create_block_diagonal_mask,
+    create_block_diagonal_sdpa_mask,
+    VisionScaledDotProductAttention,
     VisionTransformerBlock,
 )
 from torchtitan.protocols.module import Module, ModuleDict
@@ -444,14 +446,24 @@ class MoonViTEncoder(Module):
         learned_pos, rope_cache = self.compute_position_embeddings(grids)
         x = self.patch_embed(pixel_values) + learned_pos
 
-        # BlockMask creation and use in FlexAttention are blackboxed from
-        # typechecking.
+        # FlexAttention consumes a compiled BlockMask. The NPU compatibility
+        # backend instead consumes an exact dense mask and avoids Flex compilation.
         with spmd.no_typecheck():
-            attention_mask = create_block_diagonal_mask(
-                segment_lengths,
-                total_tokens,
-                x.device,
-            )
+            if isinstance(
+                self.config.block.attn.inner_attention,
+                VisionScaledDotProductAttention.Config,
+            ):
+                attention_mask = create_block_diagonal_sdpa_mask(
+                    segment_lengths,
+                    total_tokens,
+                    x.device,
+                )
+            else:
+                attention_mask = create_block_diagonal_mask(
+                    segment_lengths,
+                    total_tokens,
+                    x.device,
+                )
 
         for block in self.layers.values():
             x = block(
