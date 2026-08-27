@@ -368,8 +368,9 @@ class FlexAttention(Module):
 class ScaledDotProductAttention(Module):
     """Inner attention using ``F.scaled_dot_product_attention`` with CP support.
 
-    ``forward()`` adapts ``(B, L, N, H)`` to the kernel's ``(B, N, L, H)``
-    layout and converts the result back to ``(B, L, N, H)``.
+    ``forward()`` accepts batched ``(B, L, N, H)`` or packed ``(T, N, H)``
+    inputs, adapts them to the kernel's ``(B, N, L, H)`` layout, and restores
+    the original layout.
 
     Note:
         The forward function must have q, k, v as the first three arguments to be
@@ -410,11 +411,19 @@ class ScaledDotProductAttention(Module):
                 "ScaledDotProductAttention does not support attention_masks; it "
                 "only supports causal/non-causal attention via is_causal."
             )
-        q_BNLH, k_BNLH, v_BNLH = (
-            q_BLNH.transpose(1, 2),
-            k_BLNH.transpose(1, 2),
-            v_BLNH.transpose(1, 2),
-        )
+        packed_inputs = q_BLNH.ndim == 3
+        if packed_inputs:
+            q_BNLH, k_BNLH, v_BNLH = (
+                q_BLNH.transpose(0, 1).unsqueeze(0),
+                k_BLNH.transpose(0, 1).unsqueeze(0),
+                v_BLNH.transpose(0, 1).unsqueeze(0),
+            )
+        else:
+            q_BNLH, k_BNLH, v_BNLH = (
+                q_BLNH.transpose(1, 2),
+                k_BLNH.transpose(1, 2),
+                v_BLNH.transpose(1, 2),
+            )
         with sdpa_kernel(self.sdpa_backends, set_priority=True):
             out_BNLH = F.scaled_dot_product_attention(
                 q_BNLH,
@@ -424,6 +433,8 @@ class ScaledDotProductAttention(Module):
                 is_causal=is_causal,
                 enable_gqa=enable_gqa,
             )
+        if packed_inputs:
+            return out_BNLH.squeeze(0).transpose(0, 1)
         return out_BNLH.transpose(1, 2)
 
 
