@@ -10,7 +10,7 @@ import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Literal, Annotated
 
 import torch
 import tyro
@@ -121,6 +121,16 @@ class Profiler(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         enable_profiling: bool = False
+        profiler_backend: Literal["torch", "torch_npu"] = "torch"
+        """Profiler implementation; torch_npu uses the CANN profiler with
+        tensorboard_trace_handler and supports profile_memory/with_stack."""
+
+        profile_memory: bool = False
+        """torch_npu backend only: record memory history."""
+
+        with_stack: bool = False
+        """torch_npu backend only: record Python stacks. Known SIGSEGV blocker
+        on torch_npu 2.12 + CANN 9.1.0 during stop_trace; keep False."""
         """Whether to enable pytorch profiler."""
 
         save_traces_folder: str = PROFILE_DIR
@@ -334,6 +344,59 @@ class Profiler(Configurable):
         }
 
         wait = profile_freq - (active + warmup)
+
+        if cfg.profiler_backend == "torch_npu":
+            if cfg.trace_post_processor is not None:
+                raise RuntimeError(
+                    "trace_post_processor is not supported by the torch_npu backend"
+                )
+            try:
+                import torch_npu
+            except ImportError as exc:
+                raise RuntimeError(
+                    "profiler_backend=torch_npu requires the torch_npu package"
+                ) from exc
+
+            npu_profiler_api = torch_npu.profiler
+            activities = [
+                npu_profiler_api.ProfilerActivity.CPU,
+                npu_profiler_api.ProfilerActivity.NPU,
+            ]
+            rank_str = f"rank{rank}"
+
+            def npu_trace_handler(prof):
+                curr_trace_dir_name = PROFILE_ITER_DIR.format(step=prof.step_num)
+                curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+                if not os.path.exists(curr_trace_dir):
+                    os.makedirs(curr_trace_dir, exist_ok=True)
+                logger.info(
+                    f"[torch_npu profiler] dumping traces at step {prof.step_num}"
+                )
+                npu_profiler_api.tensorboard_trace_handler(
+                    curr_trace_dir, worker_name=rank_str
+                )(prof)
+
+            logger.info(
+                f"[torch_npu profiler] active; traces will be saved at {trace_dir} "
+                f"(profile_memory={cfg.profile_memory}, with_stack={cfg.with_stack})"
+            )
+            if not os.path.exists(trace_dir):
+                os.makedirs(trace_dir, exist_ok=True)
+
+            torch_profiler = npu_profiler_api.profile(
+                activities=activities,
+                schedule=npu_profiler_api.schedule(
+                    wait=wait, warmup=warmup, active=active, **additional_params
+                ),
+                on_trace_ready=npu_trace_handler,
+                record_shapes=True,
+                profile_memory=cfg.profile_memory,
+                with_stack=cfg.with_stack,
+            )
+            torch_profiler.__enter__()
+            torch_profiler.step_num = global_step
+            return torch_profiler
+
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
