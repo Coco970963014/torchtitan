@@ -59,7 +59,7 @@ def parallelize_kimi_k3(
     if training.activation_offload is not None:
         if ac_config is not None:
             raise NotImplementedError(
-                "Kimi K3 activation offload P0 cannot be combined with activation "
+                "Kimi K3 activation offload P1 cannot be combined with activation "
                 "checkpointing. Run each activation-memory feature independently."
             )
         apply_activation_offload(model, config=training.activation_offload)

@@ -34,13 +34,19 @@ import torch
 
 @dataclass(kw_only=True, slots=True)
 class ActivationOffloadConfig:
-    """Saved-activation CPU offload policy for the P0 swap experiment."""
+    """Selective saved-activation offload policy for the P1 experiment."""
 
     pin_memory: bool = True
     """Allocate pinned host buffers when supported by the device backend."""
 
     device_type: str = "npu"
-    """Device type whose saved tensors are offloaded to host memory."""
+    """Device type whose saved tensors may be offloaded to host memory."""
+
+    min_tensor_bytes: int = 1 << 20
+    """Only saved tensors with at least this many bytes are offload candidates."""
+
+    max_tensor_bytes: int | None = None
+    """Optional upper bound; tensors above it stay on device."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -87,10 +93,9 @@ class TrainingConfig:
 
     activation_offload: ActivationOffloadConfig | None = None
     """
-    Optional saved-activation CPU offload policy. Distinct from FSDP parameter
-    CPU offload; only models that opt in support it.
+    Optional selective saved-activation CPU offload policy. Distinct from FSDP
+    parameter CPU offload; only models that opt in support it.
     """
-
 
     disable_cuda_graphs: bool = False
     """

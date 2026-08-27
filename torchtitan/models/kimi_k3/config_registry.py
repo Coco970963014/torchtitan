@@ -110,20 +110,22 @@ def kimi_k3_debugmodel_npu_compat() -> Trainer.Config:
     return config
 
 
-def kimi_k3_debugmodel_npu_compat_p0_off() -> Trainer.Config:
-    """P0 feature-off control: SDPA compat, no AC, no activation offload."""
+def kimi_k3_debugmodel_npu_compat_p1_off() -> Trainer.Config:
+    """P1 feature-off control: SDPA compat, no AC, no activation offload."""
     config = kimi_k3_debugmodel_npu_compat()
     config.activation_checkpoint = None
     config.training.activation_offload = None
     return config
 
 
-def kimi_k3_debugmodel_npu_compat_p0_swap_on() -> Trainer.Config:
-    """P0 swap-on: SDPA compat with public save_on_cpu activation offload."""
+def kimi_k3_debugmodel_npu_compat_p1_swap_on() -> Trainer.Config:
+    """P1 swap-on: selective pinned saved-tensor CPU offload."""
     config = kimi_k3_debugmodel_npu_compat()
     config.activation_checkpoint = None
     config.training.activation_offload = ActivationOffloadConfig(
         pin_memory=True,
         device_type="npu",
+        min_tensor_bytes=1 << 20,
+        max_tensor_bytes=None,
     )
     return config
