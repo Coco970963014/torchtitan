@@ -9,7 +9,8 @@
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
+from fla.modules.conv.causal_conv1d import causal_conv1d
+from fla.modules.fused_norm_gate import rms_norm_gated
 from fla.ops.kda import chunk_kda
 from torch import nn
 
@@ -36,12 +37,14 @@ class KimiRMSNormGated(Module):
         self.weight = nn.Parameter(torch.empty(config.dim))
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        x_float = x_float * torch.rsqrt(variance + self.eps)
-        x_float = self.weight.float() * x_float
-        return (x_float * torch.sigmoid(gate.float())).to(input_dtype)
+        return rms_norm_gated(
+            x,
+            gate,
+            self.weight,
+            None,
+            activation="sigmoid",
+            eps=self.eps,
+        )
 
 
 class KimiKDAKernel(Module):
@@ -129,8 +132,13 @@ class KimiDeltaAttention(Module):
         self.dt_bias = nn.Parameter(torch.empty(config.num_heads, config.head_dim))
 
     def _causal_conv(self, x_TC: torch.Tensor, conv: Conv1d) -> torch.Tensor:
-        x_1CT = F.pad(x_TC.T.unsqueeze(0), (self.conv_kernel_size - 1, 0))
-        return F.silu(conv(x_1CT)).squeeze(0).T
+        y_1TC, _ = causal_conv1d(
+            x=x_TC.unsqueeze(0),
+            weight=conv.weight.squeeze(1),
+            activation="silu",
+            backend="triton",
+        )
+        return y_1TC.squeeze(0)
 
     def forward(
         self,

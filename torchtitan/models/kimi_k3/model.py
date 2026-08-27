@@ -7,6 +7,7 @@
 from dataclasses import dataclass, field
 
 import torch
+from fla.ops.attnres import fused_attnres
 from torch import nn
 
 from torchtitan.hf_datasets.multimodal.mm_datasets import MMSamplePackingConfig
@@ -134,21 +135,29 @@ def _apply_attention_residual(
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
-    """Apply Kimi's block-level attention residual in FP32.
+    """Apply Kimi's block-level attention residual with FLA's fused kernel.
+
+    The block residuals come first and the running prefix sum is the last
+    residual source, matching the eager concatenation order. The fused kernel
+    computes the per-source RMSNorm key normalization and the depth softmax
+    in fp32, same as the eager reference.
 
     TODO: Add TP Support. The current implementation assumes that the input tensors are on a single device.
     """
     assert norm.eps is not None
 
-    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
-    values_float = values_TND.float()
-    variance = values_float.pow(2).mean(dim=-1, keepdim=True)
-    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
-    score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
-    probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
-    output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
-    return output_TD.to(values_TND.dtype)
+    residuals = [
+        block_residual_TND[:, i, :].contiguous()
+        for i in range(block_residual_TND.shape[1])
+    ]
+    residuals.append(prefix_sum_TD)
+    return fused_attnres(
+        query=projection.weight.squeeze(0),
+        residuals=residuals,
+        rms_weight=norm.weight,
+        rms_eps=norm.eps,
+        scale=1.0,
+    )
 
 
 class KimiK3TransformerBlock(Module):
