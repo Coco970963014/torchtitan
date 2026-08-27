@@ -13,6 +13,7 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+import inspect
 from typing import Any, ClassVar, NamedTuple
 
 import spmd_types as spmd
@@ -566,10 +567,16 @@ def get_sliding_window_mask_mod(window_size: int) -> _mask_mod_signature:
 
 
 _compiled_create_block_mask = torch.compile(create_block_mask)
+_supports_separate_full_blocks = (
+    "separate_full_blocks" in inspect.signature(create_block_mask).parameters
+)
 
 
 def create_attention_mask(*args, **kwargs):
     """Create an attention mask using compiled create_block_mask."""
+    if not _supports_separate_full_blocks:
+        # PyTorch 2.12 does not expose this later FlexAttention optimization.
+        kwargs.pop("separate_full_blocks", None)
     return _compiled_create_block_mask(*args, **kwargs)
 
 
